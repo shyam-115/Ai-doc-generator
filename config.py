@@ -49,7 +49,11 @@ class Settings(BaseSettings):
     embedding_cache_file: str = Field(
         default=".embedding_cache.json", description="Embedding cache file path"
     )
+    docgen_state_file: str = Field(
+        default=".docgen_state.json", description="Incremental cache state file path"
+    )
 
 
 # Singleton settings instance
 settings = Settings()
+# Modified comment

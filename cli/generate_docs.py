@@ -25,11 +25,17 @@ import time
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.theme import Theme
+
+# ---------------------------------------------------------------------------
+# Load environment variables from .env file
+# ---------------------------------------------------------------------------
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Setup path so the CLI works both as a script and as an installed command
@@ -39,7 +45,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.utils import write_atomic
-
 from config import settings
 from logger import setup_logger
 
@@ -97,17 +102,24 @@ def cli() -> None:
     help="Run pipeline without calling the LLM (for testing).",
 )
 @click.option(
+    "--incremental",
+    "-i",
+    is_flag=True,
+    default=False,
+    help="Only process files that have changed since the last run.",
+)
+@click.option(
     "--workers",
-    "-w",
-    default=None,
     type=int,
-    help=f"Parallel workers (default: {settings.max_workers}).",
+    default=None,
+    help="Number of parallel workers (default: max_workers from config)",
 )
 def generate(
     source: str,
     output_dir: str | None,
     skip_embeddings: bool,
     dry_run: bool,
+    incremental: bool,
     workers: int | None,
 ) -> None:
     """
@@ -139,6 +151,7 @@ def generate(
             output_dir=str(out_dir),
             skip_embeddings=skip_embeddings,
             dry_run=dry_run,
+            incremental=incremental,
             max_workers=max_workers,
         )
     except KeyboardInterrupt:
@@ -162,6 +175,7 @@ def run_pipeline(
     output_dir: str = "./docs",
     skip_embeddings: bool = False,
     dry_run: bool = False,
+    incremental: bool = False,
     max_workers: int | None = None,
 ) -> None:
     """
@@ -174,11 +188,14 @@ def run_pipeline(
         output_dir: Directory to write output files.
         skip_embeddings: If True, skip FAISS indexing step.
         dry_run: If True, skip LLM calls and write placeholder files.
+        incremental: If True, only re-parse files that have changed.
         max_workers: Number of parallel parsing workers.
     """
     workers = max_workers or settings.max_workers
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    
+    state_file = out_dir / settings.docgen_state_file
 
     temp_clone_dir: str | None = None
 
@@ -231,24 +248,58 @@ def run_pipeline(
             total=len(parseable),
         )
         from parser.symbol_extractor import extract_symbols, FileSymbols
+        from core.state_manager import ProjectState
+        
+        state = ProjectState(state_file)
+        
+        # Determine which files actually need parsing
+        files_to_parse = []
+        for entry in parseable:
+            if incremental and not state.is_file_changed(entry["file"]):
+                continue
+            files_to_parse.append(entry)
+
+        if incremental and not files_to_parse:
+            progress.update(task3, description="[step]✅ No files changed (Incremental)[/step]", completed=len(parseable))
+            console.print("\n[success]✨ Incremental mode: No source files have changed since the last run. Skipping generation.[/success]")
+            
+            # Cleanup temp clone
+            if temp_clone_dir and Path(temp_clone_dir).exists():
+                shutil.rmtree(temp_clone_dir, ignore_errors=True)
+            return
 
         symbols_map: dict[str, FileSymbols] = {}
 
         def _extract_one(entry: dict) -> FileSymbols:
             return extract_symbols(entry["file"], entry["language"])
 
+        # First, load unchanged symbols from state buffer
+        if incremental:
+            for entry in parseable:
+                if entry not in files_to_parse:
+                    cached = state.get_cached_symbols(entry["file"])
+                    if cached:
+                        symbols_map[cached.file] = cached
+                        progress.advance(task3)
+
+        # Then, parse the changed files in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_extract_one, e): e for e in parseable}
+            futures = {ex.submit(_extract_one, e): e for e in files_to_parse}
             for future in concurrent.futures.as_completed(futures):
                 try:
                     sym = future.result()
                     symbols_map[sym.file] = sym
+                    if incremental:
+                        state.update_file_state(sym.file, sym)
                 except Exception as exc:
                     logger.warning("Symbol extraction error: %s", exc)
                 progress.advance(task3)
+                
+        if incremental:
+            state.save()
 
         symbols_list = list(symbols_map.values())
-        progress.update(task3, description=f"[step]✅ Extracted symbols from {len(symbols_list)} files[/step]")
+        progress.update(task3, description=f"[step]✅ Extracted symbols from {len(symbols_list)} files ({len(files_to_parse)} re-parsed)[/step]")
 
         # ------------------------------------------------------------------ #
         # STEP 4: Dependency + Call graphs
@@ -303,9 +354,18 @@ def run_pipeline(
         # STEP 7: API endpoint detection
         # ------------------------------------------------------------------ #
         task7 = progress.add_task("[step]🔌 Detecting API endpoints...[/step]", total=None)
-        from generator.api_doc_generator import detect_endpoints
-
-        endpoints = detect_endpoints(files, symbols_list)
+        
+        if not dry_run:
+            from generator.api_doc_generator import detect_endpoints
+            endpoints = detect_endpoints(files, symbols_list)
+        else:
+            # Simple endpoint detection for dry-run mode (without LLM imports)
+            endpoints = []
+            for symbols in symbols_list:
+                for func in symbols.functions:
+                    if any(decorator.startswith(('@app.', '@router.', '@bp.')) for decorator in func.decorators):
+                        endpoints.append(f"{symbols.file}::{func.name}")
+        
         progress.update(
             task7,
             description=f"[step]✅ Detected {len(endpoints)} endpoints[/step]",

@@ -73,4 +73,7 @@ def get_gemini_client() -> genai.Client:
     Returns:
         A configured :class:`google.genai.Client` instance.
     """
-    return genai.Client(api_key=settings.gemini_api_key)
+    api_key = settings.gemini_api_key or ""
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not configured")
+    return genai.Client(api_key=api_key)

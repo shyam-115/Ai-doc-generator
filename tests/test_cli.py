@@ -17,8 +17,9 @@ class TestCLIGenerateCommand:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["generate", str(temp_project_dir), "--dry-run",
-             "--output-dir", str(temp_project_dir / "docs")],
+            ["generate", str(temp_project_dir), "--dry-run", "--incremental",
+             "--output-dir", str(temp_project_dir / "docs"),
+             "--workers", "1"],
         )
         assert result.exit_code == 0, f"CLI failed: {result.output}"
         docs_dir = temp_project_dir / "docs"
@@ -30,11 +31,13 @@ class TestCLIGenerateCommand:
     def test_dry_run_readme_contains_project_name(self, temp_project_dir: Path) -> None:
         runner = CliRunner()
         out_dir = temp_project_dir / "docs2"
-        runner.invoke(
+        result = runner.invoke(
             cli,
-            ["generate", str(temp_project_dir), "--dry-run",
-             "--output-dir", str(out_dir)],
+            ["generate", str(temp_project_dir), "--dry-run", "--incremental",
+             "--output-dir", str(out_dir),
+             "--workers", "1"],
         )
+        assert result.exit_code == 0, f"CLI failed: {result.output}"
         readme = (out_dir / "README.md").read_text()
         assert temp_project_dir.name in readme
 
@@ -42,13 +45,14 @@ class TestCLIGenerateCommand:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["generate", str(temp_project_dir), "--dry-run",
+            ["generate", str(temp_project_dir), "--dry-run", "--incremental",
              "--skip-embeddings",
-             "--output-dir", str(temp_project_dir / "docs3")],
+             "--output-dir", str(temp_project_dir / "docs3"),
+             "--workers", "1"],
         )
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"CLI failed: {result.output}"
 
     def test_invalid_path_exits_nonzero(self) -> None:
         runner = CliRunner()
-        result = runner.invoke(cli, ["generate", "/nonexistent/path/to/repo"])
+        result = runner.invoke(cli, ["generate", "/nonexistent/path/to/repo", "--incremental", "--workers", "1"])
         assert result.exit_code != 0
